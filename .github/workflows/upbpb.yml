@@ -28,7 +28,9 @@ jobs:
           echo "REPO_URL=https://api.github.com/repos/bia-pain-bache/BPB-Worker-Panel/releases" >> $GITHUB_ENV
           echo "TARGET_FILE=worker.zip" >> $GITHUB_ENV
 
+      # --- 主要修改区域开始 ---
       - name: 检查并更新 Worker
+        id: check_update # <--- 修改点1：为步骤提供一个 id
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # 使用 GitHub Token 认证
         run: |
@@ -46,37 +48,62 @@ jobs:
           RESPONSE=$(curl -s --retry 3 -H "Authorization: token $GITHUB_TOKEN" -H "Accept: application/vnd.github.v3+json" "$REPO_URL")
           if [ $? -ne 0 ]; then
             log "ERROR: 无法访问 GitHub API"
+            echo "tag_name=未知(API错误)" >> $GITHUB_OUTPUT # <--- 修改点2a：即使API错误也尝试设置输出
             exit 1
           fi
 
           TAG_NAME=$(echo "$RESPONSE" | jq -r '.[0].tag_name')
           DOWNLOAD_URL=$(echo "$RESPONSE" | jq -r '.[0].assets[] | select(.name == "'"$TARGET_FILE"'") | .browser_download_url')
 
+          # 修改点2b：设置步骤输出 tag_name
+          if [ -z "$TAG_NAME" ] || [ "$TAG_NAME" == "null" ]; then
+            log "ERROR: 未能从 API 获取到有效的 TAG_NAME"
+            echo "tag_name=未知(无TAG)" >> $GITHUB_OUTPUT
+            # 如果获取不到 TAG_NAME，后续流程可能无法正常进行，考虑是否要在此处 exit 1
+            # 为保持原逻辑，暂时不退出，让后续的 DOWNLOAD_URL 检查处理
+          else
+            log "最新版本: $TAG_NAME"
+            echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT # <--- 核心！设置输出
+          fi
+
           if [ -z "$DOWNLOAD_URL" ] || [ "$DOWNLOAD_URL" == "null" ]; then
-            log "ERROR: 未找到 $TARGET_FILE"
+            log "ERROR: 未找到 $TARGET_FILE (关联版本: ${TAG_NAME:-未能获取到TAG})"
+            # 注意：如果 TAG_NAME 之前是有效的，这里的输出 tag_name 已经设置过了
             exit 1
           fi
-          log "最新版本: $TAG_NAME"
 
           # 判断是否需要更新
           FORCE_UPDATE=${{ github.event.inputs.force_update || 'false' }}
-          if [ "$LOCAL_VERSION" = "$TAG_NAME" ] && [ "$FORCE_UPDATE" != "true" ]; then
+          # 确保 TAG_NAME 有效才进行比较
+          if [ ! -z "$TAG_NAME" ] && [ "$TAG_NAME" != "null" ] && [ "$LOCAL_VERSION" = "$TAG_NAME" ] && [ "$FORCE_UPDATE" != "true" ]; then
             log "已是最新版本，无需更新"
+            # 即使不更新，tag_name 输出也已被设置，git-auto-commit-action 如果没有文件更改则不会提交
             exit 0
+          fi
+
+          # 如果 TAG_NAME 无效，则不应继续下载
+          if [ -z "$TAG_NAME" ] || [ "$TAG_NAME" == "null" ]; then
+            log "ERROR: TAG_NAME 无效，无法继续更新流程。"
+            # tag_name 输出已设置为 "未知(无TAG)"
+            exit 1
           fi
 
           # 下载并更新
           log "下载 $TARGET_FILE..."
           wget -q -O "$TARGET_FILE" "$DOWNLOAD_URL"
           log "解压 $TARGET_FILE..."
-          unzip -o "$TARGET_FILE"
+          unzip -oq "$TARGET_FILE" # <--- 修改点2c：使用 -oq 安静模式解压并覆盖
           rm "$TARGET_FILE"
           echo "$TAG_NAME" > version.txt
           log "更新完成，新版本: $TAG_NAME"
+      # --- 主要修改区域结束 ---
 
       - name: 提交更改
-        if: success() # 仅在更新成功时提交
+        # if: success() # 这是默认行为，如果前一步成功则执行
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: "🔄 自动同步 Worker 版本: ${{ steps.check_update.outputs.tag_name || '未知' }}"
+          # 使用步骤输出。如果输出为空，则回退到 '未知(回退)'
+          commit_message: "🔄 自动同步 Worker 版本: ${{ steps.check_update.outputs.tag_name || '未知(回退)' }}"
           commit_author: "github-actions[bot] <github-actions[bot]@users.noreply.github.com>"
+          # 可选：精确控制哪些文件更改才触发提交
+          # file_pattern: 'version.txt _worker.js'
